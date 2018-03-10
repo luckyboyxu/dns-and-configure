@@ -1,0 +1,135 @@
+DNS架构部署及配置
+1、puppetseerver.conf
+  [master]
+  vardir          = /opt/puppetlabs/server/data/puppetserver
+  logdir          = /var/log/puppetlabs/puppetserver
+  rundir          = /var/run/puppetlabs/puppetserver
+  pidfile         = /var/run/puppetlabs/puppetserver/puppetserver.pid
+  codedir         = /etc/puppetlabs/code                   #配置代码目录
+  autosign        = /etc/puppetlabs/puppet/autosign.conf   #配置主机自动认证
+  reports         = http,store                             #报告存储方式，http接口方式和store本地磁盘存储方式
+  reporturl       = http://puppetweb.xx.com/reports.php   #自定义http接口
+2、autosign.conf
+  *.xxx.com    #主机名以.xxx.com和dns结尾的主机自动认证
+  *.dns
+3、puppetagent.conf
+  [main]
+  certname = hq03.dns.xxx.com         #指定客户端主机名
+  server = puppet                     #指定puppetserver服务端主机名,如不指定，默认为puppet，agent端能解析puppet主机名或者绑host
+  environment = production            #指定生产环境
+  runinterval = 300                   #每隔300秒请求puppetserver读取配置
+
+
+4、dns.pp
+  node /[0-9a-zA-Z]+\.dns\.xxx\.com/  #任何主机名能匹配该正则表达式的DNS主机
+  {
+    include dns                       #读取dns模块，该模块包含了dns的配置信息
+  }
+5、dns模块
+  class dns {                         #dns模块名定义
+    file { 'dns etc':                 #dns的etc配置目录
+      path     => '/etc/bind',
+      mode     => '0644',
+      recurse  => 'true',
+      purge    => 'true',
+      force    => 'true',
+      ensure   => 'present',
+      source   => 'puppet:///modules/dns/etc',
+    }
+    file { 'view template':           #name.conf.views模板配置文件，用于差异化配置，详细内容见下面的view文件
+      path    => '/etc/bind/named.conf.views',
+      mode    => '0644',
+      ensure  => 'present',
+      content => template("dns/named.conf.views.erb"), 
+    }
+    ......
+    exec { '/usr/sbin/rndc reload':   #服务reload，subscribe表明当这些目录文件有改动时，dns服务会触发reload重新加载配置
+      command     => '/usr/sbin/rndc reload',
+      subscribe   => File["/etc/bind","/var/lib/bind","/var/lib/bind/db.xxx.com","/etc/bind/named.conf.options",
+      "/etc/bind/named.conf.views","/var/lib/bind/db.xxx.com","/var/lib/bind/db.wsus.com"],
+      refreshonly => true;
+    }
+  }
+-------------------------------------------------------------------------------------------------------------------------------------
+DNS配置
+ACL
+  acl ldap_server {          #ldap
+    10.10.0.112/32;
+    ......
+  };
+  acl cn_internal_net {      #国内
+    # SZ branch
+    10.0/16;
+    ......
+  };
+  acl forigen_net {          #国外
+    # Asia
+    10.112/16;
+    ......
+  };
+  ......
+---------------------------------------------------------------------------------------------------------------------------------------
+VIEW
+  view "china_view" {
+    match-clients {
+      cn_internal_net;
+    }; 
+    forwarders {
+      114.114.114.114; 223.5.5.5; 223.6.6.6; 114.114.115.115;
+    };
+    forward only;
+    recursion yes;
+    <% if @clientcert == 'sh01.dns.xxx.com' %>  
+      # 上海DNS的mail邮件服务直接走公网
+      zone "mail.xxxcorp.com" { type forward; forward only; forwarders { 114.114.114.114; 114.114.115.115; }; }; 
+      # xxx.com访问上海自身的域控服务器
+      zone "xxx.com" { type forward; forward only; forwarders { 10.97.72.111; 10.97.72.112; }; };
+      # GT服务访问国内的公网
+      include "/etc/bind/zones.gtxxx.internet.china";
+      include "/etc/bind/zones.blacklist";
+    <% end %>
+    <% if @clientcert == "hq01.dns.xxx.com" or @clientcert == "hq02.dns.xxx.com" or @clientcert == "hq03.dns.xxx.com" or @clientcert == "hq04.dns.xxx.com" %>
+      # xxx.com访问深圳总部的域控服务器
+      zone "xxx.com" { type forward; forward only; forwarders { 10.10.0.111; 10.10.1.111; }; };
+    <% end %>
+    zone "xxx.com" {
+      type master;
+      file "/var/lib/bind/db.xxx.com";
+    };
+    .......
+};
+------------------------------------------------------------------------------------------------------------------------------
+view "forigen_view" {
+  match-clients {
+    forigen_net;
+  };
+  forwarders {
+    8.8.8.8; 8.8.4.4; 
+    8.8.8.8; 8.8.4.4; 
+  };
+  forward only;
+  recursion yes;
+  include "/etc/bind/zones.default";
+  <% if @clientcert == 'jp01.dns.xxx.com' %>
+    # xxx.com访问日本本地的域控服务器（主）及深圳总部域控服务器（备）
+    zone "xxx.com" { type forward; forward only; forwarders { 10.114.18.111; 10.10.1.111; }; }; 
+  <% end %>
+  <% if @clientcert == 'us01.dns.xxx.com' %>
+    # xxx.com访问美国本地的域控服务器（主）及深圳总部域控服务器（备）
+    zone "xxx.com" { type forward; forward only; forwarders { 10.128.1.183; 10.10.1.111; }; }; 
+  <% end %>
+  zone "it.com" { type master; file "/var/lib/bind/db.it.com"; };
+  zone "xxxcorp.com" { type master; file "/var/lib/bind/db.xxxcorp.com"; };
+  zone "xxxplus.com" { type master; file "/var/lib/bind/db.xxxplus.com"; };
+  zone "xxxsec.com" { type master; file "/var/lib/bind/db.xxxsec.com"; };
+  zone "oa.com" { type master; file "/var/lib/bind/db.oa.com"; };
+  zone "xxx.com" { type master; file "/var/lib/bind/db.gtxxx.com"; };
+  # 邮件服务走公网
+  zone "mail.xxxcorp.com" { type forward; forward only; forwarders { 8.8.8.8; 8.8.4.4; }; }; 
+  zone "xxxcorp.com" { type master; file "/var/lib/bind/db.xxxcorp.com"; };
+  zone "xxxcorp2.com" { type master; file "/var/lib/bind/db.xxxcorp2.com"; };
+  zone "xxxts.com" { type master; file "/var/lib/bind/db.xxxts.com"; };
+  # 部分服务走公网
+  include "/etc/bind/zones.gtxxx.internet.forigen";
+  include "/etc/bind/zones.hasselblad";
+};
